@@ -8,9 +8,9 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <linux/videodev2.h>
-// #include <errno.h>
 #include <poll.h>
 #include <stdint.h>
+#include <time.h>
 
 #define OUTPUT_BUFFER_COUNT  4
 #define CAPTURE_BUFFER_COUNT 4
@@ -272,7 +272,6 @@ int dq_output() {
 }
 
 void dq_capture() {
-    // poll_ev();
     struct v4l2_buffer buf;
     struct v4l2_plane  planes[1];
     memset(&buf, 0, sizeof(buf));
@@ -334,6 +333,7 @@ int main(int argc, char *argv[]) {
         perror("REQBUFS OUTPUT");
         return 1;
     }
+    printf("OUTPUT BUFFER COUNT = %d\n", reqbuf.count);
 
     // QUERYBUF and mmap OUTPUT buffers
     for (int i = 0; i < OUTPUT_BUFFER_COUNT; i++) {
@@ -388,6 +388,7 @@ int main(int argc, char *argv[]) {
         perror("REQBUFS CAPTURE");
         return 1;
     }
+    printf("CAPTURE BUFFER COUNT = %d\n", capbuf.count);
 
     // QUERYBUF and mmap CAPTURE buffers
     for (int i = 0; i < CAPTURE_BUFFER_COUNT; i++) {
