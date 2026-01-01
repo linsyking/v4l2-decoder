@@ -3,11 +3,11 @@ decoder: v4l2_decode.c
 
 test.h264:
 	ffmpeg -f lavfi -i testsrc=size=1920x1080:rate=30 \
-		-frames:v 100 \
+		-frames:v 30 \
 		-c:v libx264 \
 		-profile:v baseline \
 		-level 3.1 \
 		-pix_fmt yuv420p \
-		-x264-params keyint=30:scenecut=0 \
+ 		-x264-params keyint=10:scenecut=0 \
 		-f h264 \
 		test.h264

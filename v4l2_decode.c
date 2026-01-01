@@ -1,12 +1,15 @@
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <fcntl.h>
+#include <sys/poll.h>
 #include <unistd.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <linux/videodev2.h>
-#include <errno.h>
+// #include <errno.h>
+#include <poll.h>
 #include <stdint.h>
 
 #define OUTPUT_BUFFER_COUNT  4
@@ -59,6 +62,17 @@ struct video {
     long     *fsizes;
 };
 
+static int is_slice(uint8_t *frame) {
+    uint8_t kf;
+    if (frame[2] == 0) {
+        kf = frame[4];
+    } else {
+        kf = frame[3];
+    }
+    kf = kf & 0x1f;
+    return kf >= 1 && kf <= 5;
+}
+
 struct video get_video_frames(char *filename) {
     struct video v;
     memset(&v, 0, sizeof(struct video));
@@ -85,52 +99,43 @@ struct video get_video_frames(char *filename) {
         uint8_t *frame = extract_one_frame(buf, size, &offset, &frame_size);
         if (!frame)
             break;
-        frame_idx++;
+        if (is_slice(frame)) {
+            frame_idx++;
+        }
         free(frame);
     }
-    v.num_frames = frame_idx - 3;
+    v.num_frames = frame_idx;
 
-    v.frames  = malloc((frame_idx) * sizeof(uint8_t *));
-    v.fsizes  = malloc((frame_idx) * sizeof(long));
-    offset    = 0;
-    frame_idx = 0;
-    // Handle first 3 frames (SPS, PPS, IDR)
-    long fsize0, fsize1, fsize2, fsize3;
-    v.fsizes[0]     = 0;
-    uint8_t *frame0 = extract_one_frame(buf, size, &offset, &fsize0);
-    v.fsizes[0] += fsize0;
-    uint8_t *frame1 = extract_one_frame(buf, size, &offset, &fsize1);
-    v.fsizes[0] += fsize1;
-    uint8_t *frame2 = extract_one_frame(buf, size, &offset, &fsize2);
-    v.fsizes[0] += fsize2;
-    uint8_t *frame3 = extract_one_frame(buf, size, &offset, &fsize3);
-    v.fsizes[0] += fsize3;
-    v.frames[0] = malloc(v.fsizes[0]);
-    long pos    = 0;
-    memcpy(v.frames[0] + pos, frame0, fsize0);
-    pos += fsize0;
-    free(frame0);
-    memcpy(v.frames[0] + pos, frame1, fsize1);
-    pos += fsize1;
-    free(frame1);
-    memcpy(v.frames[0] + pos, frame2, fsize2);
-    pos += fsize2;
-    free(frame2);
-    memcpy(v.frames[0] + pos, frame3, fsize3);
-    pos += fsize3;
-    free(frame3);
-    frame_idx++;
+    v.frames          = malloc((frame_idx) * sizeof(uint8_t *));
+    v.fsizes          = malloc((frame_idx) * sizeof(long));
+    offset            = 0;
+    frame_idx         = 0;
+    uint8_t *acc      = NULL;
+    long     acc_size = 0;
 
     while (offset < size) {
         long     fsize;
         uint8_t *frame = extract_one_frame(buf, size, &offset, &fsize);
         if (!frame)
             break;
-        v.frames[frame_idx] = frame;
-        v.fsizes[frame_idx] = fsize;
-        frame_idx++;
-    }
 
+        // Collect frames
+        acc = realloc(acc, acc_size + fsize);
+        memcpy(acc + acc_size, frame, fsize);
+        acc_size += fsize;
+
+        if (is_slice(frame)) {
+            // Slice
+            v.frames[frame_idx] = acc;
+            v.fsizes[frame_idx] = acc_size;
+            frame_idx++;
+
+            acc      = NULL;
+            acc_size = 0;
+        }
+
+        free(frame);
+    }
     free(buf);
     return v;
 }
@@ -144,8 +149,107 @@ struct buffer {
 
 struct buffer outbufs[OUTPUT_BUFFER_COUNT];
 struct buffer capbufs[CAPTURE_BUFFER_COUNT];
+struct video  v_data;
+size_t        current_frame;
+int           fd;
 
-void dq_output(int fd) {
+void change_resolution() {
+    struct v4l2_format gfmt;
+    memset(&gfmt, 0, sizeof(gfmt));
+    gfmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    if (ioctl(fd, VIDIOC_G_FMT, &gfmt) < 0) {
+        perror("G_FMT CAPTURE");
+        return;
+    }
+
+    int  fcc        = gfmt.fmt.pix_mp.pixelformat;
+    char fcc_str[5] = {(char)(fcc & 0xFF), (char)((fcc >> 8) & 0xFF), (char)((fcc >> 16) & 0xFF),
+                       (char)((fcc >> 24) & 0xFF), '\0'};
+
+    printf("CAPTURE format: width=%d, height=%d, pixelformat=%s\n", gfmt.fmt.pix_mp.width,
+           gfmt.fmt.pix_mp.height, fcc_str);
+}
+
+void poll_ev() {
+    struct pollfd pfd[1];
+    pfd[0].fd     = fd;
+    pfd[0].events = POLLIN | POLLOUT | POLLPRI;
+    int res       = poll(pfd, 1, -1);
+    // printf("Found %d event: %d\n", res, pfd[0].revents);
+    if (pfd[0].revents) {
+        if (pfd[0].revents & POLLIN) {
+            // printf("POLLIN\n");
+        }
+        if (pfd[0].revents & POLLOUT) {
+            // printf("POLLOUT\n");
+        }
+        if (pfd[0].revents & POLLPRI) {
+            // printf("POLLPRI\n");
+
+            struct v4l2_event ev;
+            memset(&ev, 0, sizeof(struct v4l2_event));
+            if (ioctl(fd, VIDIOC_DQEVENT, &ev) < 0) {
+                perror("DQEVENT");
+                return;
+            }
+            printf("Event %d observed\n", ev.type);
+            if (ev.type == V4L2_EVENT_SOURCE_CHANGE) {
+                change_resolution();
+            }
+        }
+    }
+}
+
+int q_output() {
+    if (current_frame == v_data.num_frames) {
+        printf("All frames queued\n");
+        return 1;
+    }
+    size_t fid           = current_frame++;
+    size_t i             = fid % OUTPUT_BUFFER_COUNT;
+    outbufs[i].bytesused = v_data.fsizes[fid];
+    memcpy(outbufs[i].start, v_data.frames[fid], v_data.fsizes[fid]);
+    struct v4l2_buffer buf;
+    struct v4l2_plane  planes[1];
+    memset(&buf, 0, sizeof(buf));
+    memset(planes, 0, sizeof(planes));
+    planes[0].bytesused    = outbufs[i].bytesused;
+    planes[0].length       = outbufs[i].length;
+    planes[0].m.mem_offset = outbufs[i].mem_offset;
+    buf.type               = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+    buf.memory             = V4L2_MEMORY_MMAP;
+    buf.index              = i;
+    buf.m.planes           = planes;
+    buf.length             = 1;
+    if (ioctl(fd, VIDIOC_QBUF, &buf) < 0) {
+        perror("QBUF OUTPUT");
+        return 2;
+    }
+    printf("OUTPUT QBUF index=%d, bytesused=%d, frameid=%ld/%ld\n", buf.index,
+           buf.m.planes[0].bytesused, fid, v_data.num_frames);
+    return 0;
+}
+
+void q_capture(int i) {
+    struct v4l2_buffer buf;
+    struct v4l2_plane  planes[1];
+    memset(&buf, 0, sizeof(buf));
+    memset(planes, 0, sizeof(planes));
+    planes[0].bytesused    = capbufs[i].bytesused;
+    planes[0].length       = capbufs[i].length;
+    planes[0].m.mem_offset = capbufs[i].mem_offset;
+    buf.type               = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    buf.memory             = V4L2_MEMORY_MMAP;
+    buf.index              = i;
+    buf.m.planes           = planes;
+    buf.length             = 1;
+    if (ioctl(fd, VIDIOC_QBUF, &buf) < 0) {
+        perror("QBUF CAPTURE");
+    }
+}
+
+int dq_output() {
+    // poll_ev();
     struct v4l2_buffer buf;
     struct v4l2_plane  planes[1];
     memset(&buf, 0, sizeof(buf));
@@ -156,12 +260,19 @@ void dq_output(int fd) {
     buf.length   = 1;
     if (ioctl(fd, VIDIOC_DQBUF, &buf) < 0) {
         perror("DQBUF OUTPUT");
-        return;
+        return 2;
+    }
+    if (outbufs[buf.index].bytesused != buf.m.planes[0].bytesused) {
+        printf("Mismatch OUTPUT DQBUF index=%d, bytesused=%d, expected=%zu\n", buf.index,
+               buf.m.planes[0].bytesused, outbufs[buf.index].bytesused);
+        return 2;
     }
     printf("OUTPUT DQBUF index=%d, bytesused=%d\n", buf.index, buf.m.planes[0].bytesused);
+    return q_output();
 }
 
-void dq_capture(int fd) {
+void dq_capture() {
+    // poll_ev();
     struct v4l2_buffer buf;
     struct v4l2_plane  planes[1];
     memset(&buf, 0, sizeof(buf));
@@ -176,6 +287,7 @@ void dq_capture(int fd) {
     }
     capbufs[buf.index].bytesused = buf.m.planes[0].bytesused;
     printf("CAPTURE DQBUF index=%d, bytesused=%d\n", buf.index, buf.m.planes[0].bytesused);
+    q_capture(buf.index);
 }
 
 int main(int argc, char *argv[]) {
@@ -183,12 +295,21 @@ int main(int argc, char *argv[]) {
         printf("Usage: %s <v4l2_device> <input_h264_file>\n", argv[0]);
         return 1;
     }
-    int fd = open(argv[1], O_RDWR);
+    fd = open(argv[1], O_RDWR);
     if (fd < 0) {
         perror("open");
         return 1;
     }
-    struct video v = get_video_frames(argv[2]);
+    v_data        = get_video_frames(argv[2]);
+    current_frame = 0;
+
+    struct v4l2_event_subscription ev_sub;
+    memset(&ev_sub, 0, sizeof(struct v4l2_event_subscription));
+    ev_sub.type = V4L2_EVENT_SOURCE_CHANGE;
+    if (ioctl(fd, VIDIOC_SUBSCRIBE_EVENT, &ev_sub) < 0) {
+        perror("SUBSCRIBE EVENT");
+        return 1;
+    }
 
     // Set OUTPUT format (H.264)
     struct v4l2_format fmt;
@@ -230,7 +351,7 @@ int main(int argc, char *argv[]) {
             perror("QUERYBUF OUTPUT");
             return 1;
         }
-        outbufs[i].bytesused  = v.fsizes[i];
+        outbufs[i].bytesused  = v_data.fsizes[i];
         outbufs[i].length     = buf.m.planes[0].length;
         outbufs[i].mem_offset = buf.m.planes[0].m.mem_offset;
         outbufs[i].start = mmap(NULL, outbufs[i].length, PROT_READ | PROT_WRITE, MAP_SHARED, fd,
@@ -239,29 +360,10 @@ int main(int argc, char *argv[]) {
             perror("mmap OUTPUT");
             return 1;
         }
-        memcpy(outbufs[i].start, v.frames[i], v.fsizes[i]);
     }
 
     // QBUF all OUTPUT buffers
-    for (int i = 0; i < OUTPUT_BUFFER_COUNT; i++) {
-        struct v4l2_buffer buf;
-        struct v4l2_plane  planes[1];
-        memset(&buf, 0, sizeof(buf));
-        memset(planes, 0, sizeof(planes));
-        planes[0].bytesused    = outbufs[i].bytesused;
-        planes[0].length       = outbufs[i].length;
-        planes[0].m.mem_offset = outbufs[i].mem_offset;
-        buf.type               = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
-        buf.memory             = V4L2_MEMORY_MMAP;
-        buf.index              = i;
-        buf.m.planes           = planes;
-        buf.length             = 1;
-        if (ioctl(fd, VIDIOC_QBUF, &buf) < 0) {
-            perror("QBUF OUTPUT");
-            return 1;
-        }
-        printf("OUTPUT QBUF index=%d, bytesused=%d\n", buf.index, buf.m.planes[0].bytesused);
-    }
+    q_output();
 
     // STREAMON
     {
@@ -272,20 +374,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    struct v4l2_format gfmt;
-    memset(&gfmt, 0, sizeof(gfmt));
-    gfmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-    if (ioctl(fd, VIDIOC_G_FMT, &gfmt) < 0) {
-        perror("G_FMT CAPTURE");
-        return 1;
-    }
-
-    int  fcc        = gfmt.fmt.pix_mp.pixelformat;
-    char fcc_str[5] = {(char)(fcc & 0xFF), (char)((fcc >> 8) & 0xFF), (char)((fcc >> 16) & 0xFF),
-                       (char)((fcc >> 24) & 0xFF), '\0'};
-
-    printf("CAPTURE format: width=%d, height=%d, pixelformat=%s\n", gfmt.fmt.pix_mp.width,
-           gfmt.fmt.pix_mp.height, fcc_str);
+    poll_ev();
 
     // CAPTURE
 
@@ -300,7 +389,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // QUERYBUF and mmap OUTPUT buffers
+    // QUERYBUF and mmap CAPTURE buffers
     for (int i = 0; i < CAPTURE_BUFFER_COUNT; i++) {
         struct v4l2_buffer buf;
         struct v4l2_plane  planes[1];
@@ -316,6 +405,7 @@ int main(int argc, char *argv[]) {
             perror("QUERYBUF CAPTURE");
             return 1;
         }
+        capbufs[i].bytesused  = buf.m.planes[0].length;
         capbufs[i].length     = buf.m.planes[0].length;
         capbufs[i].mem_offset = buf.m.planes[0].m.mem_offset;
         capbufs[i].start = mmap(NULL, capbufs[i].length, PROT_READ | PROT_WRITE, MAP_SHARED, fd,
@@ -328,22 +418,7 @@ int main(int argc, char *argv[]) {
 
     // QBUF all CAPTURE buffers
     for (int i = 0; i < CAPTURE_BUFFER_COUNT; i++) {
-        struct v4l2_buffer buf;
-        struct v4l2_plane  planes[1];
-        memset(&buf, 0, sizeof(buf));
-        memset(planes, 0, sizeof(planes));
-        planes[0].bytesused    = capbufs[i].bytesused;
-        planes[0].length       = capbufs[i].length;
-        planes[0].m.mem_offset = capbufs[i].mem_offset;
-        buf.type               = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-        buf.memory             = V4L2_MEMORY_MMAP;
-        buf.index              = i;
-        buf.m.planes           = planes;
-        buf.length             = 1;
-        if (ioctl(fd, VIDIOC_QBUF, &buf) < 0) {
-            perror("QBUF CAPTURE");
-            return 1;
-        }
+        q_capture(i);
     }
 
     // STREAMON CAPTURE
@@ -355,12 +430,16 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    for (int i = 0; i < OUTPUT_BUFFER_COUNT; i++) {
-        dq_output(fd);
-    }
-
-    for (int i = 0; i < CAPTURE_BUFFER_COUNT; i++) {
-        dq_capture(fd);
+    while (1) {
+        int ret = dq_output();
+        if (ret == 1) {
+            // Done
+            break;
+        }
+        if (ret == 2) {
+            return 1;
+        }
+        dq_capture();
     }
 
     // Export data
