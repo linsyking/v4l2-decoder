@@ -3,7 +3,7 @@ decoder: v4l2_decode.c
 
 test.h264:
 	ffmpeg -f lavfi -i testsrc=size=1920x1080:rate=30 \
-		-frames:v 30 \
+		-frames:v 60 \
 		-c:v libx264 \
 		-profile:v baseline \
 		-level 3.1 \

@@ -166,7 +166,7 @@ void change_resolution() {
     char fcc_str[5] = {(char)(fcc & 0xFF), (char)((fcc >> 8) & 0xFF), (char)((fcc >> 16) & 0xFF),
                        (char)((fcc >> 24) & 0xFF), '\0'};
 
-    printf("CAPTURE format: width=%d, height=%d, pixelformat=%s\n", gfmt.fmt.pix_mp.width,
+    printf("Capture format: width=%d, height=%d, pixelformat=%s\n", gfmt.fmt.pix_mp.width,
            gfmt.fmt.pix_mp.height, fcc_str);
 }
 
@@ -174,8 +174,7 @@ void poll_ev() {
     struct pollfd pfd[1];
     pfd[0].fd     = fd;
     pfd[0].events = POLLIN | POLLOUT | POLLPRI;
-    int res       = poll(pfd, 1, -1);
-    // printf("Found %d event: %d\n", res, pfd[0].revents);
+    poll(pfd, 1, -1);
     if (pfd[0].revents) {
         if (pfd[0].revents & POLLIN) {
             // printf("POLLIN\n");
@@ -192,12 +191,22 @@ void poll_ev() {
                 perror("DQEVENT");
                 return;
             }
-            printf("Event %d observed\n", ev.type);
+            // printf("Event %d observed\n", ev.type);
             if (ev.type == V4L2_EVENT_SOURCE_CHANGE) {
                 change_resolution();
             }
         }
     }
+}
+
+void wcap2file(int i) {
+    FILE *f = fopen("output.nv12", "wb");
+    if (!f) {
+        perror("fopen output");
+        return;
+    }
+    fwrite(capbufs[i].start, 1, capbufs[i].bytesused, f);
+    fclose(f);
 }
 
 int q_output() {
@@ -225,8 +234,8 @@ int q_output() {
         perror("QBUF OUTPUT");
         return 2;
     }
-    printf("OUTPUT QBUF index=%d, bytesused=%d, frameid=%ld/%ld\n", buf.index,
-           buf.m.planes[0].bytesused, fid, v_data.num_frames);
+    // printf("OUTPUT QBUF index=%d, bytesused=%d, frameid=%ld/%ld\n", buf.index,
+    //        buf.m.planes[0].bytesused, fid, v_data.num_frames);
     return 0;
 }
 
@@ -267,7 +276,7 @@ int dq_output() {
                buf.m.planes[0].bytesused, outbufs[buf.index].bytesused);
         return 2;
     }
-    printf("OUTPUT DQBUF index=%d, bytesused=%d\n", buf.index, buf.m.planes[0].bytesused);
+    // printf("OUTPUT DQBUF index=%d, bytesused=%d\n", buf.index, buf.m.planes[0].bytesused);
     return q_output();
 }
 
@@ -285,8 +294,39 @@ void dq_capture() {
         return;
     }
     capbufs[buf.index].bytesused = buf.m.planes[0].bytesused;
-    printf("CAPTURE DQBUF index=%d, bytesused=%d\n", buf.index, buf.m.planes[0].bytesused);
+    // printf("CAPTURE DQBUF index=%d, bytesused=%d\n", buf.index, buf.m.planes[0].bytesused);
     q_capture(buf.index);
+}
+
+void streamon_output() {
+    enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+    if (ioctl(fd, VIDIOC_STREAMON, &type) < 0) {
+        perror("STREAMON OUTPUT");
+        return;
+    }
+}
+
+void streamon_capture() {
+    enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    if (ioctl(fd, VIDIOC_STREAMON, &type) < 0) {
+        perror("STREAMON CAPTURE");
+        return;
+    }
+}
+void streamoff_output() {
+    enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+    if (ioctl(fd, VIDIOC_STREAMOFF, &type) < 0) {
+        perror("STREAMOFF OUTPUT");
+        return;
+    }
+}
+
+void streamoff_capture() {
+    enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    if (ioctl(fd, VIDIOC_STREAMOFF, &type) < 0) {
+        perror("STREAMOFF CAPTURE");
+        return;
+    }
 }
 
 int main(int argc, char *argv[]) {
@@ -333,7 +373,7 @@ int main(int argc, char *argv[]) {
         perror("REQBUFS OUTPUT");
         return 1;
     }
-    printf("OUTPUT BUFFER COUNT = %d\n", reqbuf.count);
+    // printf("OUTPUT BUFFER COUNT = %d\n", reqbuf.count);
 
     // QUERYBUF and mmap OUTPUT buffers
     for (int i = 0; i < OUTPUT_BUFFER_COUNT; i++) {
@@ -362,17 +402,11 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    // QBUF all OUTPUT buffers
+    // QBUF first frame to get video info
     q_output();
 
     // STREAMON
-    {
-        enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
-        if (ioctl(fd, VIDIOC_STREAMON, &type) < 0) {
-            perror("STREAMON OUTPUT");
-            return 1;
-        }
-    }
+    streamon_output();
 
     poll_ev();
 
@@ -388,7 +422,7 @@ int main(int argc, char *argv[]) {
         perror("REQBUFS CAPTURE");
         return 1;
     }
-    printf("CAPTURE BUFFER COUNT = %d\n", capbuf.count);
+    // printf("CAPTURE BUFFER COUNT = %d\n", capbuf.count);
 
     // QUERYBUF and mmap CAPTURE buffers
     for (int i = 0; i < CAPTURE_BUFFER_COUNT; i++) {
@@ -423,15 +457,9 @@ int main(int argc, char *argv[]) {
     }
 
     // STREAMON CAPTURE
-    {
-        enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-        if (ioctl(fd, VIDIOC_STREAMON, &type) < 0) {
-            perror("STREAMON CAPTURE");
-            return 1;
-        }
-    }
+    streamon_capture();
 
-    while (1) {
+    for (int i = 0; i < 5; ++i) {
         int ret = dq_output();
         if (ret == 1) {
             // Done
@@ -443,20 +471,30 @@ int main(int argc, char *argv[]) {
         dq_capture();
     }
 
-    // Export data
+    streamoff_capture();
+    streamoff_output();
 
-    // for (int i = 0; i < CAPTURE_BUFFER_COUNT; i++) {
-    //     // Write to file
-    //     char filename[64];
-    //     snprintf(filename, sizeof(filename), "output_frame_%d.nv12", i);
-    //     FILE *f = fopen(filename, "wb");
-    //     if (!f) {
-    //         perror("fopen output");
-    //         continue;
-    //     }
-    //     fwrite(capbufs[i].start, 1, capbufs[i].bytesused, f);
-    //     fclose(f);
-    // }
+    current_frame = 50;  // Seek
+
+    q_output();
+    streamon_output();
+
+    for (int i = 0; i < CAPTURE_BUFFER_COUNT; i++) {
+        q_capture(i);
+    }
+    streamon_capture();
+
+    for (int i = 0; i < 100; ++i) {
+        int ret = dq_output();
+        if (ret == 1) {
+            // Done
+            break;
+        }
+        if (ret == 2) {
+            return 1;
+        }
+        dq_capture();
+    }
 
     close(fd);
     return 0;
